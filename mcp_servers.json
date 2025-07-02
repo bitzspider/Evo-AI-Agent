@@ -1,0 +1,48 @@
+{
+  "mcpServers": {
+    "time_server": {
+      "type": "file",
+      "path": "custom_tools/time_server.py",
+      "description": "Time and date operations",
+      "enabled": true
+    },
+    "gmail_server": {
+      "type": "file",
+      "path": "custom_tools/google_gmail.py",
+      "description": "Email operations via Gmail",
+      "enabled": true
+    },
+    "fetch": {
+      "command": "python",
+      "args": [
+        "-m",
+        "mcp_server_fetch"
+      ],
+      "description": "HTTP requests and web content fetching"
+    },
+    "server_memory": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-memory"
+      ],
+      "description": "MCP server: server_memory"
+    },
+    "windows-cli": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@simonb97/server-win-cli"
+      ],
+      "description": "MCP server: windows-cli"
+    },
+    "mcp-deepwiki": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-deepwiki@latest"
+      ],
+      "description": "MCP server: mcp-deepwiki"
+    }
+  }
+}
