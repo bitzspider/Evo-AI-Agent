@@ -1250,7 +1250,8 @@ def create_gradio_interface(agent):
                             label="MCP Server Configuration (JSON)",
                             language="json",
                             lines=8,
-                            placeholder='{\n  "command": "npx",\n  "args": ["-y", "@modelcontextprotocol/server-memory"]\n}'
+                            value='',
+                            info='Example: {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-memory"]}'
                         )
                         
                     with gr.Column(scale=1):
