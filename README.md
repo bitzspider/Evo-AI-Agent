@@ -1,6 +1,6 @@
 # 🤖 EVO AI Agent (100% Vibe Coded)
 
-An AI agent application with MCP (Model Context Protocol) integration, featuring an intuitive Gradio interface, local Ollama support, and extensible tool system.
+An AI agent application with MCP (Model Context Protocol) integration, Gradio interface, Ollama, and extensible tool system.
 
 ## 🚀 Quick Start
 
