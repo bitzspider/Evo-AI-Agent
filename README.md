@@ -1,4 +1,4 @@
-# 🤖 EVO AI Agent (100% Vibe Coded)
+# 🤖 EVO AI Agent
 
 An AI agent application with MCP (Model Context Protocol) integration, Gradio interface, Ollama, and extensible tool system.
 
