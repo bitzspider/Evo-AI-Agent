@@ -32,3 +32,6 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.temp 
+
+# App data
+chat_history/*.pkl
