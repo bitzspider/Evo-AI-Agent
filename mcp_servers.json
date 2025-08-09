@@ -3,7 +3,7 @@
     "time_server": {
       "type": "file",
       "path": "custom_tools/time_server.py",
-      "description": "Time and date operations",
+      "description": "Get the current date and time in ISO 8601 format",
       "enabled": true
     },
     "gmail_server": {

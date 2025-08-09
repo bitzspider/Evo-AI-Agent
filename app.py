@@ -14,6 +14,8 @@ from mcp.client.session import ClientSession
 from mcp.client.stdio import stdio_client
 from mcp import StdioServerParameters
 import json
+import pickle
+from datetime import datetime
 
 # Load environment variables
 load_dotenv()
@@ -22,6 +24,8 @@ class OllamaAgent:
     def __init__(self):
         self.host = os.getenv('OLLAMA_HOST', 'http://localhost:11434')
         self.model = os.getenv('OLLAMA_MODEL', 'qwen3:latest')
+        self.temperature = float(os.getenv('OLLAMA_TEMPERATURE', '0.6'))
+        self.action_temperature = float(os.getenv('OLLAMA_ACTION_TEMPERATURE', '0.2'))
         
         # Initialize Ollama client
         self.client = ollama.Client(host=self.host)
@@ -31,6 +35,12 @@ class OllamaAgent:
         self.available_tools = {}
         self.system_prompt = ""
         self._tools_discovered = False  # Flag to track lazy loading
+        
+        # Initialize chat history
+        self.current_chat_id = None
+        self.chat_history_dir = "chat_history"
+        self.metadata_file = os.path.join(self.chat_history_dir, "metadata.json")
+        self._init_chat_history()
         
         print("🔄 Enhanced schema communication - tools will be rediscovered with detailed parameters")
         
@@ -318,59 +328,192 @@ class OllamaAgent:
                 tools_section += "\n"
         
         tools_section += """=== TOOL USAGE INSTRUCTIONS ===
-To use a tool, respond with JSON in this exact format:
-{
-  "action": "use_tool",
-  "tool_name": "exact_tool_name",
-  "parameters": {
-    "param1": "value1",
-    "param2": "value2"
-  },
-  "explanation": "Brief explanation of why you're using this tool"
-}
+Use exactly one tool per assistant message, as pure JSON (no extra text):
+{"tool_name": "exact_tool_name", "parameters": {...}, "explanation": "brief reason"}
 
-MULTI-TOOL AUTONOMOUS BEHAVIOR:
-- You can use multiple tools in sequence to complete complex tasks
-- After each tool execution, you'll receive the result and can decide what to do next
-- You can use results from previous tools to inform subsequent tool usage
-- When you have all the information needed, provide your final response to the user
-- Examples of multi-tool workflows:
-  * "Email me the current time" → get_current_time, then send_email with the time
-  * "Send me a summary email" → gather info with various tools, then send_email
-  * Complex tasks may require 3+ tools in sequence
+MULTI-TOOL WORKFLOWS (FEW-SHOT):
+User: "Email me the current time"
+Assistant -> {"tool_name": "get_current_time", "parameters": {"format": "human"}, "explanation": "Need current time first"}
+(Tool returns "Current time: ...")
+Assistant -> {"tool_name": "send_email", "parameters": {"subject": "Current time", "message": "Current time: ..."}, "explanation": "Send the requested email"}
+(Tool returns success)
+Assistant (final text): "✅ Sent you the current time by email."
+
+User: "Fetch https://example.com and email me the contents"
+Assistant -> {"tool_name": "fetch", "parameters": {"url": "https://example.com"}, "explanation": "Fetch page content"}
+(Tool returns content)
+Assistant -> {"tool_name": "send_email", "parameters": {"subject": "Requested content", "message": "<summary of content>..."}, "explanation": "Deliver results via email"}
+(Tool returns success)
+Assistant (final text): "✅ Emailed you the requested content."
+
+CRITICAL TASK COMPLETION RULES:
+- NEVER stop mid-task. If the user asks to email/send/save, execute the corresponding tool.
+- Verify you've fully completed the request before finishing.
 
 WHEN TO USE TOOLS:
-- When the user asks you to DO something (send email, get time, etc.) - ALWAYS use the appropriate tool
-- When you need information that tools can provide
-- When performing actions that match tool capabilities
-- Use your judgment to determine if multiple tools are needed for complex requests
+- Use tools when the user asks you to DO something or when tool data is needed.
 
 EMAIL TOOL NOTES:
-- send_email automatically sends to the configured notification recipient
-- You only need to provide "subject" and "message" parameters
-- DO NOT provide to_email, from_name, or recipient parameters
-- Focus on creating helpful, clear subject lines and message content
-- The recipient is automatically handled by the system configuration
+- send_email uses the configured recipient; only provide "subject" and "message".
 
 IMPORTANT:
-- The tool_name must exactly match one of the available tools listed above
-- Use the tools in server_memory to store and retrieve personal information provided by the user, for example their name
-- Use the read_graph tool to retrieve stored information about the user when that information is needed
-- Follow parameter schemas EXACTLY - use only the valid enum values shown
-- Always provide an explanation for why you're using each tool
-- If a tool returns an error (like "Input validation error" or "Error:"), recognize it as a failure
-- When a tool fails, DO NOT make up or guess the answer - report the error to the user
-- For parameter validation errors, check the schema and try again with correct values
-- Think step by step for complex requests that may need multiple tools
+- tool_name must exactly match one of the available tools above.
+- Follow input schemas strictly.
+- On tool errors, correct parameters and retry or pick an alternative.
+- Final message must be plain text only; JSON is only for tool calls.
 """
         
         self.system_prompt = base_prompt + tools_section
         total_tools = sum(len(tools) for tools in self.available_tools.values() if tools)
         print(f"✅ System prompt rebuilt with {total_tools} available tools")
 
+    def _llm_chat(self, messages, expect_json: bool = False, temperature: float | None = None):
+        """Wrapper around Ollama chat with optional JSON-enforced output and tuned temperature.
+
+        Keeping a single place to set options reduces drift and helps small models stay on format.
+        """
+        opts = {"temperature": (temperature if temperature is not None else self.temperature)}
+        # Allow optional larger context via env
+        num_ctx = os.getenv('OLLAMA_NUM_CTX')
+        if num_ctx:
+            try:
+                opts["num_ctx"] = int(num_ctx)
+            except Exception:
+                pass
+        if expect_json:
+            # Ask Ollama to constrain output as JSON when we expect a tool call
+            opts["format"] = "json"
+        return self.client.chat(
+            model=self.model,
+            messages=messages,
+            stream=False,
+            options=opts
+        )
+
+    def _assess_task_completion(self, original_request, tools_used, latest_tool_result):
+        """Assess whether the original user request has been fully completed"""
+        
+        # Extract key action verbs from original request
+        action_indicators = {
+            'send_email': ['email', 'send', 'mail', 'notify'],
+            'fetch': ['fetch', 'get', 'retrieve', 'download'],
+            'save': ['save', 'store', 'write', 'file'],
+            'search': ['search', 'find', 'look'],
+            'execute': ['run', 'execute', 'command'],
+            'get_current_time': ['time', 'date', 'current']
+        }
+        
+        request_lower = original_request.lower()
+        
+        # Determine what actions were requested
+        requested_actions = []
+        for tool, keywords in action_indicators.items():
+            if any(keyword in request_lower for keyword in keywords):
+                requested_actions.append(tool)
+        
+        # Check if all requested actions have been completed
+        completed_actions = [tool_info['name'] for tool_info in tools_used]
+        
+        # Special multi-tool pattern detection
+        is_fetch_and_email = ('fetch' in requested_actions and 'send_email' in requested_actions)
+        is_get_time_and_email = ('get_current_time' in requested_actions and 'send_email' in requested_actions)
+        
+        # Task completion assessment
+        if is_fetch_and_email:
+            if 'fetch' in completed_actions and 'send_email' in completed_actions:
+                return {'complete': True, 'reason': 'Both fetch and email completed'}
+            elif 'fetch' in completed_actions and 'send_email' not in completed_actions:
+                return {'complete': False, 'reason': 'Fetched content but email not sent', 'next_action': 'send_email'}
+            else:
+                return {'complete': False, 'reason': 'Fetch not completed', 'next_action': 'fetch'}
+        
+        elif is_get_time_and_email:
+            if 'get_current_time' in completed_actions and 'send_email' in completed_actions:
+                return {'complete': True, 'reason': 'Both time retrieval and email completed'}
+            elif 'get_current_time' in completed_actions and 'send_email' not in completed_actions:
+                return {'complete': False, 'reason': 'Got time but email not sent', 'next_action': 'send_email'}
+            else:
+                return {'complete': False, 'reason': 'Time not retrieved', 'next_action': 'get_current_time'}
+        
+        # Single action requests
+        elif len(requested_actions) == 1:
+            if requested_actions[0] in completed_actions:
+                return {'complete': True, 'reason': f'Requested action {requested_actions[0]} completed'}
+            else:
+                return {'complete': False, 'reason': f'Requested action {requested_actions[0]} not completed', 'next_action': requested_actions[0]}
+        
+        # Default assessment based on common patterns
+        else:
+            # If user asked for any action-oriented request and we haven't done it
+            action_verbs = ['send', 'email', 'save', 'store', 'notify', 'run', 'execute']
+            has_action_request = any(verb in request_lower for verb in action_verbs)
+            
+            if has_action_request and not tools_used:
+                return {'complete': False, 'reason': 'Action requested but no tools used', 'next_action': 'determine_tool'}
+            elif has_action_request and tools_used:
+                # Check if the last tool result indicates success
+                if 'error' in latest_tool_result.lower() or 'failed' in latest_tool_result.lower():
+                    return {'complete': False, 'reason': 'Tool execution failed', 'next_action': 'retry_or_alternative'}
+                else:
+                    return {'complete': True, 'reason': 'Action appears to have been completed'}
+            else:
+                return {'complete': True, 'reason': 'Informational request satisfied'}
+
+    def _create_structured_decision_prompt(self, original_request, tool_name, tool_result, tools_used):
+        """Create a structured decision prompt to guide the agent's next action"""
+        
+        # Assess task completion
+        task_assessment = self._assess_task_completion(original_request, tools_used, tool_result)
+        
+        # Check if tool result has errors or warnings
+        has_errors = any(indicator in tool_result.lower() for indicator in [
+            'error', 'failed', 'timeout', 'truncated', 'start_index', 'try again', 'incomplete'
+        ])
+        
+        has_sufficient_content = len(tool_result) > 100  # Has meaningful content
+        clipped = self._compress_for_prompt(tool_result, 1200)
+        
+        # Build structured prompt
+        prompt = f"""TASK EVALUATION:
+- Original request: "{original_request}"
+- Tool just executed: {tool_name}
+- Tools used so far: {[t['name'] for t in tools_used]}
+- Task completion status: {"COMPLETE" if task_assessment['complete'] else "INCOMPLETE"}
+- Reason: {task_assessment['reason']}
+
+TOOL RESULT ANALYSIS:
+ - Result length: {len(tool_result)} characters
+- Has errors/warnings: {"YES" if has_errors else "NO"}
+- Has sufficient content: {"YES" if has_sufficient_content else "NO"}
+ - Tool result (clipped): {clipped}
+
+DECISION GUIDANCE:"""
+
+        # Tight constraints for small models
+        allowed_tools = self._get_all_available_tools()
+        prompt += f"""
+You must either:
+- OUTPUT EXACTLY ONE tool call as pure JSON, or
+- If and only if the task is fully complete, output FINAL text (no JSON).
+
+When using a tool, return JSON with this exact shape and nothing else:
+{{"tool_name": "one_of_allowed", "parameters": {{...}}, "explanation": "why"}}
+
+Allowed tool_name values: {allowed_tools}
+One tool per message. Do not include any text outside the JSON.
+"""
+
+        if task_assessment['complete']:
+            prompt += """\nFINAL: Provide the final text answer (no JSON, no extra thinking)."""
+        else:
+            next_action = task_assessment.get('next_action', 'determine_next_step')
+            prompt += f"""\nNEXT ACTION: {next_action}"""
+
+        return prompt
+
     def chat(self, message, history):
         """
-        Handle chat interaction with single tool execution
+        Handle chat interaction with multi-tool execution and structured decision making
         
         Args:
             message: User input message
@@ -400,22 +543,23 @@ IMPORTANT:
             # Add current message
             conversation.append({"role": "user", "content": message})
             
+            # Store original request for task completion assessment
+            original_request = message
+            
             # Get LLM response
             print(f"🤖 [CHAT] Getting LLM response...")
             print(f"🤖 [CHAT] Using model: {self.model}")
-            response = self.client.chat(
-                model=self.model,
-                messages=conversation,
-                stream=False
-            )
+            print(f"🤖 [CHAT] Using temperature: {self.temperature}")
+            response = self._llm_chat(conversation, expect_json=False, temperature=self.temperature)
             
             assistant_response = response['message']['content']
             print(f"🤖 [CHAT] LLM Response: {assistant_response[:200]}{'...' if len(assistant_response) > 200 else ''}")
             
-            # Multi-tool execution loop
+            # Multi-tool execution loop with structured decision making
             current_response = assistant_response
             max_tool_calls = 5  # Prevent infinite loops
             tool_call_count = 0
+            tools_used = []  # Track tools used for completion assessment
             
             while tool_call_count < max_tool_calls:
                 # Check if current response wants to use a tool
@@ -423,26 +567,58 @@ IMPORTANT:
                 tool_request = self._parse_tool_request(current_response)
                 
                 if not tool_request:
-                    # No more tools needed, parse and format thinking content before returning
+                    # No more tools needed, return current response
                     print(f"🤖 [CHAT] ✅ No tool needed, returning response after {tool_call_count} tool calls")
-                    print(f"{'='*60}\n")
+                    print(f"🤖 [CHAT] 📝 Final response length: {len(current_response)} characters")
                     
-                    # Parse and format thinking content
-                    parsed_response = self._parse_thinking_content(current_response)
-                    if parsed_response['has_thinking']:
-                        print(f"🧠 [CHAT] Calling format function with thinking content: {len(parsed_response['thinking_content'])} chars")
-                        formatted_result = self._format_response_with_thinking(
-                            parsed_response['main_content'], 
-                            parsed_response['thinking_content']
-                        )
-                        print(f"🧠 [CHAT] Formatted result length: {len(formatted_result)}")
-                        print(f"🧠 [CHAT] Contains brain icon: {'brain-icon-corner' in formatted_result}")
-                        return formatted_result
+                    # Strip thinking content from final response
+                    thinking_result = self._parse_thinking_content(current_response)
+                    if thinking_result['has_thinking']:
+                        final_response = thinking_result['main_content'].strip()
+                        print(f"🤖 [CHAT] 🧠 Stripped thinking content from final response")
                     else:
-                        print(f"🧠 [CHAT] No thinking content found, returning original response")
-                        return current_response
+                        final_response = current_response
+                    
+                    # If response is empty or too short, provide a default completion message
+                    if not final_response.strip() or len(final_response.strip()) < 10:
+                        if tool_call_count > 0:
+                            final_response = f"✅ Task completed! I successfully executed {tool_call_count} tool(s) to fulfill your request."
+                            print(f"🤖 [CHAT] 📝 Using default completion message")
+                    
+                    print(f"🤖 [CHAT] 📝 Final response content: '{final_response}'")
+                    print(f"{'='*60}\n")
+                    return final_response
                 
-                # LLM wants to use a tool
+                # Check if tool request has proper format
+                if 'tool_name' not in tool_request or 'parameters' not in tool_request:
+                    # JSON exists but format is wrong - provide tool-specific error correction
+                    print(f"🤖 [CHAT] 🚨 Malformed tool request detected - providing specific guidance")
+                    
+                    # Try to extract attempted tool name from various fields
+                    attempted_tool = None
+                    for field in ['tool', 'tool_name', 'name']:
+                        if field in tool_request:
+                            attempted_tool = tool_request[field]
+                            break
+                    
+                    # Create tool-specific error correction
+                    error_correction = self._create_tool_specific_error_correction(attempted_tool, tool_request)
+                    
+                    # Add error correction to conversation
+                    conversation.append({"role": "assistant", "content": current_response})
+                    conversation.append({"role": "system", "content": error_correction})
+                    
+                    # Get corrected response from LLM
+                    print(f"🤖 [CHAT] Getting corrected response from LLM...")
+                    next_response = self._llm_chat(conversation, expect_json=True, temperature=self.action_temperature)
+                    
+                    current_response = next_response['message']['content']
+                    print(f"🤖 [CHAT] Got corrected response: {current_response[:100]}...")
+                    
+                    # Continue loop to check if this response has more tool requests
+                    continue
+                
+                # LLM wants to use a tool with correct format
                 tool_name = tool_request['tool_name']
                 parameters = tool_request['parameters']
                 explanation = tool_request.get('explanation', 'Using tool')
@@ -465,86 +641,51 @@ IMPORTANT:
                 tool_result = self._execute_tool_sync(tool_name, parameters, server_name)
                 print(f"🤖 [CHAT] Tool result: {tool_result}")
                 
-                # Add previous response and tool result to conversation
-                conversation.append({"role": "assistant", "content": current_response})
-                conversation.append({"role": "system", "content": f"Tool '{tool_name}' result: {tool_result}"})
+                # Track tools used for completion assessment
+                tools_used.append({
+                    'name': tool_name,
+                    'parameters': parameters,
+                    'result': tool_result
+                })
                 
-                # Get next response from LLM with tool result
-                print(f"🤖 [CHAT] Getting next response with tool result...")
-                print(f"🤖 [CHAT] Using model: {self.model}")
-                print(f"🤖 [CHAT] Conversation length: {len(conversation)} messages")
-                print(f"🤖 [CHAT] Last message role: {conversation[-1]['role']}")
-                print(f"🤖 [CHAT] Last message preview: {conversation[-1]['content'][:200]}...")
-
-                try:
-                    next_response = self.client.chat(
-                        model=self.model,
-                        messages=conversation,
-                        stream=False
-                    )
-                    
-                    print(f"🤖 [CHAT] Raw response keys: {list(next_response.keys())}")
-                    
-                    if 'message' in next_response:
-                        print(f"🤖 [CHAT] Message keys: {list(next_response['message'].keys())}")
-                        current_response = next_response['message']['content']
-                        print(f"🤖 [CHAT] Content length: {len(current_response)}")
-                        print(f"🤖 [CHAT] Raw content: '{current_response}'")
-                        print(f"🤖 [CHAT] Content preview: {current_response[:100]}...")
-                        
-                        # If response is empty, add a fallback
-                        if not current_response or current_response.strip() == "":
-                            print(f"🤖 [CHAT] ⚠️ Empty response detected, using fallback")
-                            current_response = f"I successfully used the {tool_name} tool. The result was: {tool_result}"
-                    else:
-                        print(f"🤖 [CHAT] ❌ No 'message' key in response!")
-                        current_response = f"I used the {tool_name} tool successfully. The result was: {tool_result}"
-                        
-                except Exception as e:
-                    print(f"🤖 [CHAT] ❌ Error calling LLM: {e}")
-                    current_response = f"I used the {tool_name} tool successfully. The result was: {tool_result}"
+                # Add previous response to conversation
+                conversation.append({"role": "assistant", "content": current_response})
+                
+                # Create structured decision prompt instead of simple tool result
+                decision_prompt = self._create_structured_decision_prompt(
+                    original_request, tool_name, tool_result, tools_used
+                )
+                conversation.append({"role": "system", "content": decision_prompt})
+                
+                # Get next response from LLM with structured guidance
+                print(f"🤖 [CHAT] Getting next response with structured decision guidance...")
+                next_response = self._llm_chat(conversation, expect_json=True, temperature=self.action_temperature)
+                
+                current_response = next_response['message']['content']
+                print(f"🤖 [CHAT] Got next response: {current_response[:100]}...")
                 
                 # Continue loop to check if this response has more tool requests
             
             # If we hit max tool calls, return what we have
             print(f"🤖 [CHAT] ⚠️  Hit maximum tool calls ({max_tool_calls}), returning current response")
-            print(f"{'='*60}\n")
             
-            # Parse and format thinking content before returning
-            parsed_response = self._parse_thinking_content(current_response)
-            if parsed_response['has_thinking']:
-                print(f"🧠 [CHAT] (Max tools) Calling format function with thinking content: {len(parsed_response['thinking_content'])} chars")
-                formatted_result = self._format_response_with_thinking(
-                    parsed_response['main_content'], 
-                    parsed_response['thinking_content']
-                )
-                print(f"🧠 [CHAT] (Max tools) Formatted result length: {len(formatted_result)}")
-                print(f"🧠 [CHAT] (Max tools) Contains brain icon: {'brain-icon-corner' in formatted_result}")
-                return formatted_result
+            # Strip thinking content from final response
+            thinking_result = self._parse_thinking_content(current_response)
+            if thinking_result['has_thinking']:
+                final_response = thinking_result['main_content'].strip()
+                print(f"🤖 [CHAT] 🧠 Stripped thinking content from final response")
             else:
-                print(f"🧠 [CHAT] (Max tools) No thinking content found, returning original response")
-                return current_response
+                final_response = current_response
+            
+            print(f"{'='*60}\n")
+            return final_response
             
         except Exception as e:
             error_msg = f"Error in chat: {str(e)}"
             print(f"🤖 [CHAT] ❌ ERROR: {error_msg}")
             import traceback
             print(f"🤖 [CHAT] Traceback: {traceback.format_exc()}")
-            
-            # Parse and format thinking content even for errors (in case error response has thinking)
-            parsed_response = self._parse_thinking_content(error_msg)
-            if parsed_response['has_thinking']:
-                print(f"🧠 [CHAT] (Error) Calling format function with thinking content: {len(parsed_response['thinking_content'])} chars")
-                formatted_result = self._format_response_with_thinking(
-                    parsed_response['main_content'], 
-                    parsed_response['thinking_content']
-                )
-                print(f"🧠 [CHAT] (Error) Formatted result length: {len(formatted_result)}")
-                print(f"🧠 [CHAT] (Error) Contains brain icon: {'brain-icon-corner' in formatted_result}")
-                return formatted_result
-            else:
-                print(f"🧠 [CHAT] (Error) No thinking content found, returning original error")
-                return error_msg
+            return error_msg
 
     def _execute_tool_sync(self, tool_name, parameters, server_name):
         """Synchronous wrapper for tool execution"""
@@ -668,48 +809,188 @@ IMPORTANT:
         return None
 
     def _parse_tool_request(self, response_text):
-        """Parse LLM response for tool usage requests"""
+        """Parse LLM response for tool usage requests with strict JSON format"""
+        import json
+        
         print(f"🔍 [TOOL PARSER] Parsing response for tool requests...")
         print(f"🔍 [TOOL PARSER] Response length: {len(response_text)} characters")
         
+        # Strip thinking content first to prevent interference with tool detection
+        thinking_result = self._parse_thinking_content(response_text)
+        clean_response = thinking_result['main_content']
+        
+        if thinking_result['has_thinking']:
+            print(f"🔍 [TOOL PARSER] 🧠 Stripped thinking content, using clean response")
+            print(f"🔍 [TOOL PARSER] Clean response length: {len(clean_response)} characters")
+        
+        # Try strict JSON (when we enforced JSON output)
         try:
-            # Look for JSON in the response
-            start_idx = response_text.find('{')
-            end_idx = response_text.rfind('}') + 1
+            strict = json.loads(clean_response)
+            if isinstance(strict, dict) and 'tool_name' in strict and 'parameters' in strict:
+                print("🔍 [TOOL PARSER] ✅ Strict JSON tool request")
+                return strict
+        except Exception:
+            pass
+
+        try:
+            # Find all potential JSON blocks by looking for balanced braces in clean response
+            start_idx = clean_response.find('{')
+            if start_idx == -1:
+                print(f"🔍 [TOOL PARSER] ❌ No opening brace found")
+                return None
             
-            print(f"🔍 [TOOL PARSER] JSON search - start: {start_idx}, end: {end_idx}")
+            # Find the matching closing brace by counting nesting
+            brace_count = 0
+            end_idx = -1
             
-            if start_idx == -1 or end_idx == 0:
-                print(f"🔍 [TOOL PARSER] ❌ No JSON found in response")
+            for i in range(start_idx, len(clean_response)):
+                if clean_response[i] == '{':
+                    brace_count += 1
+                elif clean_response[i] == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        end_idx = i + 1
+                        break
+            
+            if end_idx == -1:
+                print(f"🔍 [TOOL PARSER] ❌ No matching closing brace found")
                 return None
                 
-            json_str = response_text[start_idx:end_idx]
-            print(f"🔍 [TOOL PARSER] Extracted JSON: {json_str}")
+            json_str = clean_response[start_idx:end_idx]
+            print(f"🔍 [TOOL PARSER] Extracted JSON (length {len(json_str)}): {json_str[:200]}{'...' if len(json_str) > 200 else ''}")
             
+            # Parse the JSON
             tool_request = json.loads(json_str)
-            print(f"🔍 [TOOL PARSER] Parsed JSON: {tool_request}")
+            print(f"🔍 [TOOL PARSER] Successfully parsed JSON")
             
-            # Validate required fields
-            if (tool_request.get('action') == 'use_tool' and 
-                'tool_name' in tool_request and 
-                'parameters' in tool_request):
+            # Store the raw JSON for error correction if needed
+            tool_request['_raw_json'] = json_str
+            
+            # Strict format validation - only accept exact format
+            if ('tool_name' in tool_request and 'parameters' in tool_request):
                 print(f"🔍 [TOOL PARSER] ✅ Valid tool request found: {tool_request['tool_name']}")
                 return tool_request
             else:
-                print(f"🔍 [TOOL PARSER] ❌ Invalid tool request format")
-                print(f"🔍 [TOOL PARSER]   Action: {tool_request.get('action')}")
-                print(f"🔍 [TOOL PARSER]   Has tool_name: {'tool_name' in tool_request}")
-                print(f"🔍 [TOOL PARSER]   Has parameters: {'parameters' in tool_request}")
+                # JSON exists but format is wrong - return it for tool-specific error correction
+                print(f"🔍 [TOOL PARSER] ❌ JSON found but wrong format")
+                print(f"🔍 [TOOL PARSER]   Found fields: {list(tool_request.keys())}")
+                return tool_request  # Return the malformed request for specific error handling
                 
         except json.JSONDecodeError as e:
             print(f"🔍 [TOOL PARSER] ❌ JSON decode error: {e}")
-        except KeyError as e:
-            print(f"🔍 [TOOL PARSER] ❌ Key error: {e}")
+            return None
         except Exception as e:
             print(f"🔍 [TOOL PARSER] ❌ Unexpected error: {e}")
+            return None
+    
+    def _create_tool_specific_error_correction(self, attempted_tool, malformed_request):
+        """Create tool-specific error correction with exact schema for the attempted tool"""
+        print(f"🔍 [TOOL PARSER] Creating tool-specific error correction for: {attempted_tool}")
+        
+        # Find the tool schema
+        tool_schema = None
+        tool_description = None
+        
+        if attempted_tool:
+            for server_tools in self.available_tools.values():
+                for tool in server_tools:
+                    if tool['name'] == attempted_tool:
+                        tool_schema = tool.get('schema', {})
+                        tool_description = tool.get('description', '')
+                        break
+                if tool_schema:
+                    break
+        
+        # Build tool-specific correction message
+        if tool_schema and attempted_tool:
+            correction_msg = f"""
+🚨 TOOL FORMAT ERROR: You attempted to use tool '{attempted_tool}' but used wrong JSON format.
+
+Your JSON had these fields: {list(malformed_request.keys())}
+Required fields: tool_name, parameters
+
+CORRECT FORMAT for '{attempted_tool}':
+{{
+  "tool_name": "{attempted_tool}",
+  "parameters": {{"""
             
-        print(f"🔍 [TOOL PARSER] ❌ No valid tool request found")
-        return None
+            # Add specific parameters from schema
+            props = tool_schema.get('properties', {})
+            required_params = tool_schema.get('required', [])
+            
+            if props:
+                for param_name, param_info in props.items():
+                    param_type = param_info.get('type', 'string')
+                    param_desc = param_info.get('description', 'No description')
+                    is_required = param_name in required_params
+                    
+                    if param_type == 'string':
+                        example_value = f'"example_value"'
+                    elif param_type == 'integer':
+                        example_value = '0'
+                    elif param_type == 'boolean':
+                        example_value = 'true'
+                    elif param_type == 'object':
+                        example_value = '{}'
+                    elif param_type == 'array':
+                        example_value = '[]'
+                    else:
+                        example_value = '"value"'
+                    
+                    required_marker = " [REQUIRED]" if is_required else " [OPTIONAL]"
+                    correction_msg += f"""
+    "{param_name}": {example_value}{required_marker}  // {param_desc}"""
+                    
+                    # Show enum values if available
+                    if 'enum' in param_info:
+                        enum_values = param_info['enum']
+                        correction_msg += f" | Valid values: {enum_values}"
+            else:
+                correction_msg += """
+    "param1": "value1",
+    "param2": "value2\""""
+            
+            correction_msg += f"""
+  }},
+  "explanation": "Brief explanation of why using {attempted_tool}"
+}}
+
+Tool Description: {tool_description}
+
+Please use the EXACT format above and try again."""
+        
+        else:
+            # Generic correction if we can't find the specific tool
+            available_tools = self._get_all_available_tools()
+            correction_msg = f"""
+🚨 TOOL FORMAT ERROR: Invalid JSON format for tool request.
+
+Your JSON had these fields: {list(malformed_request.keys())}
+Required fields: tool_name, parameters
+
+CORRECT FORMAT:
+{{
+  "tool_name": "exact_tool_name",
+  "parameters": {{
+    "param1": "value1",
+    "param2": "value2"
+  }},
+  "explanation": "Brief explanation"
+}}
+
+Available tools: {', '.join(available_tools)}
+
+Please use the EXACT format above and try again."""
+        
+        return correction_msg
+    
+    def _get_all_available_tools(self):
+        """Get list of all available tool names"""
+        tools = []
+        for server_tools in self.available_tools.values():
+            for tool in server_tools:
+                tools.append(tool['name'])
+        return tools
 
     def _parse_thinking_content(self, response_text):
         """Parse thinking content from LLM response and separate it from main content"""
@@ -789,6 +1070,41 @@ IMPORTANT:
         """
         
         return formatted_html
+
+    def _compress_for_prompt(self, text: str, max_chars: int = 1200) -> str:
+        """Compress long tool outputs to keep small models focused and within context limits."""
+        if not text:
+            return ""
+        t = text.strip()
+        if len(t) <= max_chars:
+            return t
+        head = t[: max_chars // 2]
+        tail = t[-max_chars // 2 :]
+        return f"{head}\n...\n{tail}"
+
+    def _extract_clean_content_for_history(self, formatted_response):
+        """Extract clean main content from a formatted response for chat history"""
+        import re
+        
+        # If it's not HTML (no HTML tags), return as-is
+        if '<' not in formatted_response:
+            return formatted_response
+        
+        # Extract main content from HTML response
+        # Look for the main-content div
+        main_content_match = re.search(r'<div class="main-content">(.*?)</div>', formatted_response, re.DOTALL)
+        if main_content_match:
+            main_content_html = main_content_match.group(1)
+            # Convert HTML back to plain text
+            import html
+            # Replace <br> with newlines
+            clean_content = main_content_html.replace('<br>', '\n')
+            # Unescape HTML entities
+            clean_content = html.unescape(clean_content)
+            return clean_content.strip()
+        
+        # Fallback: return original if no main-content div found
+        return formatted_response
 
     # === MCP Server Management Methods ===
     
@@ -1039,16 +1355,159 @@ IMPORTANT:
             print(f"🤖 [MODEL MANAGER] ❌ Error switching model: {e}")
             return f"❌ Error switching model: {e}"
 
+    def _init_chat_history(self):
+        """Initialize chat history system"""
+        if not os.path.exists(self.chat_history_dir):
+            os.makedirs(self.chat_history_dir)
+        
+        if not os.path.exists(self.metadata_file):
+            initial_metadata = {
+                "next_id": 1,
+                "chats": []
+            }
+            with open(self.metadata_file, 'w') as f:
+                json.dump(initial_metadata, f, indent=2)
+
+    def get_chat_list(self):
+        """Get list of chat sessions for sidebar"""
+        try:
+            with open(self.metadata_file, 'r') as f:
+                metadata = json.load(f)
+            chats = metadata.get('chats', [])
+            # Return list of tuples (display_name, chat_id) for Gradio dropdown
+            return [(f"{chat['title']} ({chat['created']})", chat['id']) for chat in chats]
+        except Exception as e:
+            print(f"❌ Error loading chat list: {e}")
+            return []
+
+    def load_chat(self, chat_id):
+        """Load a chat by ID"""
+        try:
+            chat_file = os.path.join(self.chat_history_dir, f"chat_{chat_id:03d}.pkl")
+            if os.path.exists(chat_file):
+                with open(chat_file, 'rb') as f:
+                    history = pickle.load(f)
+                self.current_chat_id = chat_id
+                return history
+            return []
+        except Exception as e:
+            print(f"❌ Error loading chat {chat_id}: {e}")
+            return []
+
+    def save_chat(self, history):
+        """Save current chat"""
+        if not history or len(history) == 0:
+            return None
+        
+        try:
+            with open(self.metadata_file, 'r') as f:
+                metadata = json.load(f)
+            
+            if self.current_chat_id is None:
+                # New chat
+                chat_id = metadata['next_id']
+                metadata['next_id'] = chat_id + 1
+                
+                # Create title from first message
+                title = history[0][0][:30] + "..." if len(history[0][0]) > 30 else history[0][0]
+                
+                chat_info = {
+                    "id": chat_id,
+                    "title": title,
+                    "created": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "message_count": len(history)
+                }
+                metadata['chats'].append(chat_info)
+                self.current_chat_id = chat_id
+            else:
+                # Update existing
+                for chat in metadata['chats']:
+                    if chat['id'] == self.current_chat_id:
+                        chat['message_count'] = len(history)
+                        break
+            
+            # Save metadata and chat
+            with open(self.metadata_file, 'w') as f:
+                json.dump(metadata, f, indent=2)
+            
+            chat_file = os.path.join(self.chat_history_dir, f"chat_{self.current_chat_id:03d}.pkl")
+            with open(chat_file, 'wb') as f:
+                pickle.dump(history, f)
+            
+            return self.current_chat_id
+        except Exception as e:
+            print(f"❌ Error saving chat: {e}")
+            return None
+
+    def new_chat(self):
+        """Start new chat"""
+        self.current_chat_id = None
+        return []
+
 def create_gradio_interface(agent):
     """Create and configure the Gradio interface"""
     
     with gr.Blocks(
-        title="AI Agent - Phase 1",
+        title="AI Agent",
         theme=gr.themes.Soft(),
         css="""
         .gradio-container {
-            max-width: 1200px !important;
-            margin: auto !important;
+            max-width: 100% !important;
+            margin: 0 !important;
+            padding: 0 !important;
+        }
+        
+        /* Left sidebar styling */
+        .chat-sidebar {
+            background: #f8f9fa !important;
+            border-right: 1px solid #e9ecef !important;
+            min-height: 100vh !important;
+            padding: 10px !important;
+        }
+        
+        .new-chat-btn {
+            width: 100% !important;
+            background: #6c757d !important;
+            border: none !important;
+            color: white !important;
+            font-size: 18px !important;
+            border-radius: 4px !important;
+            padding: 8px !important;
+            margin-bottom: 10px !important;
+        }
+        
+        .new-chat-btn:hover {
+            background: #5a6268 !important;
+        }
+        
+        .chat-item {
+            padding: 8px !important;
+            margin: 2px 0 !important;
+            border-radius: 4px !important;
+            cursor: pointer !important;
+            font-size: 13px !important;
+            background: #ffffff !important;
+            border: 1px solid #dee2e6 !important;
+        }
+        
+        .chat-item:hover {
+            background: #e9ecef !important;
+        }
+        
+        /* Chat dropdown styling */
+        .chat-dropdown {
+            margin-bottom: 10px !important;
+        }
+        
+        .chat-dropdown label {
+            font-size: 12px !important;
+            color: #6c757d !important;
+            margin-bottom: 4px !important;
+        }
+        
+        /* Main chat area */
+        .main-chat {
+            padding: 20px !important;
         }
         
         /* Thinking content styling */
@@ -1097,13 +1556,6 @@ def create_gradio_interface(agent):
             border-left: 3px solid #667eea;
         }
         
-        .thinking-header {
-            font-weight: bold;
-            color: #4a5568;
-            margin-bottom: 8px;
-            font-size: 14px;
-        }
-        
         .thinking-text {
             color: #4a5568;
             line-height: 1.5;
@@ -1112,21 +1564,6 @@ def create_gradio_interface(agent):
             white-space: pre-wrap;
             word-wrap: break-word;
             max-width: 100%;
-        }
-        
-        @keyframes slideDown {
-            from {
-                opacity: 0;
-                max-height: 0;
-                padding-top: 0;
-                padding-bottom: 0;
-            }
-            to {
-                opacity: 1;
-                max-height: 500px;
-                padding-top: 12px;
-                padding-bottom: 12px;
-            }
         }
         """,
         head="""
@@ -1150,180 +1587,188 @@ def create_gradio_interface(agent):
         """
     ) as interface:
         
-        gr.Markdown(
-            """
-            # 🤖 EVAL AI Agent
-           Ask anything - the agent will autonomously choose tools when helpful!
-            """
-        )
-        
-        with gr.Tabs():
-            with gr.Tab("Chat"):
-                with gr.Row():
-                    with gr.Column(scale=3):
-                        chatbot = gr.Chatbot(
-                            label="AI Assistant",
-                            height=400,
-                            show_copy_button=True,
-                            render_markdown=False,
-                            sanitize_html=False
-                        )
+        with gr.Row():
+            # Left sidebar for chat history (OUTSIDE tabs)
+            with gr.Column(scale=1, elem_classes=["chat-sidebar"]):
+                new_chat_btn = gr.Button("+", elem_classes=["new-chat-btn"])
+                
+                # Chat history dropdown
+                chat_history_dropdown = gr.Dropdown(
+                    label="Previous Chats",
+                    choices=agent.get_chat_list(),
+                    value=None,
+                    interactive=True,
+                    elem_classes=["chat-dropdown"]
+                )
+            
+            # Main content area with tabs
+            with gr.Column(scale=5):
+                with gr.Tabs():
+                    with gr.Tab("Chat"):
+                        with gr.Row():
+                            # Main chat area
+                            with gr.Column(scale=4, elem_classes=["main-chat"]):
+                                chatbot = gr.Chatbot(
+                                    label="AI Assistant",
+                                    height=500,
+                                    show_copy_button=True
+                                )
+                                
+                                with gr.Row():
+                                    msg = gr.Textbox(
+                                        placeholder="Ask me anything...",
+                                        lines=2,
+                                        scale=5,
+                                        show_label=False
+                                    )
+                                    submit_btn = gr.Button("Send", variant="primary", scale=1)
+                            
+                            # Right sidebar for system info (minimal)
+                            with gr.Column(scale=1):
+                                gr.Markdown("### System")
+                                
+                                # Model selection dropdown
+                                available_models = agent.get_available_models()
+                                model_dropdown = gr.Dropdown(
+                                    choices=available_models,
+                                    value=agent.model,
+                                    label="Model",
+                                    interactive=True
+                                )
+                                
+                                # Model status display
+                                model_status = gr.Textbox(
+                                    label="Status", 
+                                    visible=False,
+                                    interactive=False
+                                )
+                                
+                                # Simple system info
+                                gr.Markdown(f"**Servers:** {len(agent.mcp_servers)}")
+                                if agent.available_tools:
+                                    tool_count = sum(len(tools) for tools in agent.available_tools.values())
+                                    gr.Markdown(f"**Tools:** {tool_count}")
+                    
+                    with gr.Tab("Server Management"):
+                        gr.Markdown("### Add New MCP Server")
+                        gr.Markdown("Enter server name and JSON configuration (just like Claude Desktop)")
                         
                         with gr.Row():
-                            msg = gr.Textbox(
-                                placeholder="Ask me anything...",
-                                lines=2,
-                                scale=4,
-                                show_label=False
-                            )
-                            submit_btn = gr.Button("Send", variant="primary", scale=1)
-                           
-                            clear_btn = gr.Button("Clear", variant="secondary", scale=1, visible=False)
+                            with gr.Column(scale=2):
+                                server_name_input = gr.Textbox(
+                                    label="Server Name",
+                                    placeholder="my_custom_server"
+                                )
+                                server_config_input = gr.Code(
+                                    label="MCP Server Configuration (JSON)",
+                                    language="json",
+                                    lines=8,
+                                    value='{\n  "command": "npx",\n  "args": ["-y", "@modelcontextprotocol/server-memory"]\n}'
+                                )
+                                
+                            with gr.Column(scale=1):
+                                test_btn = gr.Button("Test Configuration", variant="secondary")
+                                add_btn = gr.Button("Add Server", variant="primary")
+                                refresh_btn = gr.Button("Refresh Servers")
                         
-
-                    
-                    with gr.Column(scale=1):
-                        gr.Markdown("### System Info")
+                        status_output = gr.Textbox(label="Status", lines=3, interactive=False)
                         
-                        # Model selection dropdown
-                        available_models = agent.get_available_models()
-                        model_dropdown = gr.Dropdown(
-                            choices=available_models,
-                            value=agent.model,
-                            label="Active Model",
-                            interactive=True
-                        )
-                        
-                        # Model status display
-                        model_status = gr.Textbox(
-                            label="Model Status", 
-                            visible=False,
+                        gr.Markdown("### Active MCP Servers")
+                        servers_display = gr.Dataframe(
+                            headers=["Server", "Command", "Tools", "Status"],
+                            label="Currently Active Servers",
                             interactive=False
                         )
                         
-                        # Build tool status
-                        tool_count = sum(len(tools) for tools in agent.available_tools.values())
-                        server_count = len(agent.mcp_servers)
+                        # Add delete functionality
+                        gr.Markdown("### Remove MCP Server")
+                        with gr.Row():
+                            with gr.Column(scale=3):
+                                server_delete_dropdown = gr.Dropdown(
+                                    label="Select Server to Remove",
+                                    choices=list(agent.mcp_servers.keys()),  # Simple list, not tuples
+                                    value=None,
+                                    interactive=True
+                                )
+                            with gr.Column(scale=1):
+                                delete_btn = gr.Button(
+                                    "🗑️ Delete Server", 
+                                    variant="stop"
+                                )
                         
-                        # Get system prompt preview (first 100 chars)
-                        prompt_preview = agent.system_prompt[:100] + "..." if len(agent.system_prompt) > 100 else agent.system_prompt
+                        # Helper functions for server management  
+                        def get_server_names():
+                            return list(agent.mcp_servers.keys())
                         
-                        def build_status_info(current_model=None):
-                            model_to_show = current_model if current_model else agent.model
-                            return f"""
-                            <div style="background: #292929; padding: 10px; border-radius: 5px; color: white;">
-                                <strong>Endpoint:</strong> {agent.host}<br>
-                                <strong>Model:</strong> {model_to_show}<br>
-                                <strong>Ollama:</strong> <span style="color: green;">✅ Connected</span><br>
-                                <strong>MCP Servers:</strong> {server_count}<br>                        
-                                <strong>System Prompt:</strong><br>
-                                <div style="font-size: 0.9em; color: #666; font-style: italic; background: white; padding: 5px; border-radius: 3px; margin-top: 5px;">
-                                    {prompt_preview}
-                                </div>
-                            </div>
-                            """
+                        # Event handlers for server management
+                        def handle_test_server(config_json):
+                            try:
+                                config = json.loads(config_json)
+                                result = agent.test_server_config(config)
+                                if result["success"]:
+                                    return f"✅ {result['message']}"
+                                else:
+                                    return f"❌ Test failed: {result['error']}"
+                            except json.JSONDecodeError as e:
+                                return f"❌ Invalid JSON: {e}"
+                            except Exception as e:
+                                return f"❌ Error: {e}"
                         
-                        status_info = gr.HTML(build_status_info())
+                        def handle_add_server(server_name, config_json):
+                            if not server_name.strip():
+                                return "❌ Please enter a server name", agent.get_server_status(), get_server_names()
+                            
+                            result = agent.add_mcp_server(server_name.strip(), config_json)
+                            
+                            if result["success"]:
+                                message = f"{result['message']}"
+                                if result['tools']:
+                                    message += f"\nTools: {', '.join(result['tools'])}"
+                                return message, agent.get_server_status(), get_server_names()
+                            else:
+                                return f"❌ {result['error']}", agent.get_server_status(), get_server_names()
                         
-                        if agent.available_tools:
-                            gr.Markdown("### Available Tools")
-                            tools_html = "<div style='background: #f8f9fa; padding: 10px; border-radius: 5px; font-size: 0.9em;'>"
-                            for server_name, tools in agent.available_tools.items():
-                                tools_html += f"<strong>{server_name}:</strong><br>"
-                                for tool in tools:
-                                    tools_html += f"• {tool['name']}: {tool['description']}<br>"
-                                tools_html += "<br>"
-                            tools_html += "</div>"
-                            gr.HTML(tools_html)
-            
-            with gr.Tab("Server Management"):
-                gr.Markdown("### Add New MCP Server")
-                gr.Markdown("Enter server name and JSON configuration (just like Claude Desktop)")
-                
-                with gr.Row():
-                    with gr.Column(scale=2):
-                        server_name_input = gr.Textbox(
-                            label="Server Name",
-                            placeholder="my_custom_server"
+                        def handle_delete_server(server_name):
+                            if not server_name:
+                                return "❌ Please select a server to delete", agent.get_server_status(), get_server_names()
+                            
+                            result = agent.remove_mcp_server(server_name)
+                            
+                            if result["success"]:
+                                return f"✅ {result['message']}", agent.get_server_status(), get_server_names()
+                            else:
+                                return f"❌ {result['error']}", agent.get_server_status(), get_server_names()
+                        
+                        def handle_refresh_servers():
+                            # Force tools discovery to refresh server status
+                            agent._tools_discovered = False
+                            agent._discover_tools_lazy()
+                            servers = agent.get_server_status()
+                            return f"🔄 Servers refreshed - {len(servers)} active", servers, get_server_names()
+                        
+                        # Bind server management events
+                        test_btn.click(
+                            handle_test_server,
+                            inputs=[server_config_input],
+                            outputs=[status_output]
                         )
-                        server_config_input = gr.Code(
-                            label="MCP Server Configuration (JSON)",
-                            language="json",
-                            lines=8,
-                            value='',
-                            info='Example: {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-memory"]}'
+                        
+                        add_btn.click(
+                            handle_add_server,
+                            inputs=[server_name_input, server_config_input],
+                            outputs=[status_output, servers_display, server_delete_dropdown]
                         )
                         
-                    with gr.Column(scale=1):
-                        test_btn = gr.Button("Test Configuration", variant="secondary")
-                        add_btn = gr.Button("Add Server", variant="primary")
-                        refresh_btn = gr.Button("Refresh Servers")
-                
-                status_output = gr.Textbox(label="Status", lines=3, interactive=False)
-                
-                gr.Markdown("### Active MCP Servers")
-                servers_display = gr.Dataframe(
-                    headers=["Server", "Command", "Tools", "Status"],
-                    label="Currently Active Servers",
-                    interactive=False
-                )
-                
-                # Initialize server display with current servers
-                def get_initial_servers():
-                    return agent.get_server_status()
-                
-                # Set initial value
-                servers_display.value = get_initial_servers()
-                
-                # Event handlers for server management
-                def handle_test_server(config_json):
-                    try:
-                        config = json.loads(config_json)
-                        result = agent.test_server_config(config)
-                        if result["success"]:
-                            return f"✅ {result['message']}"
-                        else:
-                            return f"❌ Test failed: {result['error']}"
-                    except json.JSONDecodeError as e:
-                        return f"❌ Invalid JSON: {e}"
-                    except Exception as e:
-                        return f"❌ Error: {e}"
-                
-                def handle_add_server(server_name, config_json):
-                    if not server_name.strip():
-                        return "❌ Please enter a server name", agent.get_server_status()
-                    
-                    result = agent.add_mcp_server(server_name.strip(), config_json)
-                    
-                    if result["success"]:
-                        message = f"{result['message']}"
-                        if result['tools']:
-                            message += f"\nTools: {', '.join(result['tools'])}"
-                        return message, agent.get_server_status()
-                    else:
-                        return f"❌ {result['error']}", agent.get_server_status()
-                
-                def handle_refresh_servers():
-                    servers = agent.get_server_status()
-                    return f"🔄 Servers refreshed - {len(servers)} active", servers
-                
-                # Bind server management events
-                test_btn.click(
-                    handle_test_server,
-                    inputs=[server_config_input],
-                    outputs=[status_output]
-                )
-                
-                add_btn.click(
-                    handle_add_server,
-                    inputs=[server_name_input, server_config_input],
-                    outputs=[status_output, servers_display]
-                )
-                
-                refresh_btn.click(
-                    handle_refresh_servers,
-                    outputs=[status_output, servers_display]
-                )
+                        delete_btn.click(
+                            handle_delete_server,
+                            inputs=[server_delete_dropdown],
+                            outputs=[status_output, servers_display, server_delete_dropdown]
+                        )
+                        
+                        refresh_btn.click(
+                            handle_refresh_servers,
+                            outputs=[status_output, servers_display, server_delete_dropdown]
+                        )
         
         # Chat event handlers
         def respond(message, history):
@@ -1331,60 +1776,101 @@ def create_gradio_interface(agent):
                 return history, ""
             
             response = agent.chat(message, history)
-            history.append((message, response))
-            return history, ""
+            history.append([message, response])
+            
+            # Auto-save after each response
+            save_result = agent.save_chat(history)
+            
+            # Return updated dropdown choices with current chat selected
+            updated_choices = agent.get_chat_list()
+            
+            # Find the current chat in the choices to select it
+            current_selection = None
+            if agent.current_chat_id is not None:
+                for choice_display, choice_id in updated_choices:
+                    if choice_id == agent.current_chat_id:
+                        current_selection = choice_id
+                        break
+            
+            return history, "", gr.update(choices=updated_choices, value=current_selection)
         
         def clear_chat():
             return [], ""
         
-
+        # Chat history event handlers
+        
+        def handle_new_chat():
+            """Start new chat"""
+            agent.new_chat()
+            updated_choices = agent.get_chat_list()
+            return [], gr.update(choices=updated_choices, value=None)
+        
+        def handle_load_chat(selected_chat):
+            """Load selected chat"""
+            if selected_chat:
+                history = agent.load_chat(selected_chat)
+                updated_choices = agent.get_chat_list()
+                return history, gr.update(choices=updated_choices, value=selected_chat)
+            return [], gr.update()
         
         # Bind chat events
         submit_btn.click(
             respond,
             inputs=[msg, chatbot],
-            outputs=[chatbot, msg]
+            outputs=[chatbot, msg, chat_history_dropdown]
         )
         
         msg.submit(
             respond,
             inputs=[msg, chatbot],
-            outputs=[chatbot, msg]
+            outputs=[chatbot, msg, chat_history_dropdown]
         )
         
-        clear_btn.click(
-            clear_chat,
-            outputs=[chatbot, msg]
+        # Bind new chat button
+        new_chat_btn.click(
+            handle_new_chat,
+            outputs=[chatbot, chat_history_dropdown]
         )
         
-
+        # Bind dropdown selection
+        chat_history_dropdown.change(
+            handle_load_chat,
+            inputs=[chat_history_dropdown],
+            outputs=[chatbot, chat_history_dropdown]
+        )
         
-        # Model switching event handler
+        # Model switching
         def handle_model_change(selected_model):
             result = agent.change_model(selected_model)
-            print(f"🤖 [UI] Model change result: {result}")
-            
-            # Update status info to show new model
-            updated_status = build_status_info(agent.model)
-            
-            # Show/hide status message
             if result.startswith("✅"):
-                return updated_status, gr.update(value=result, visible=True)
+                return gr.update(value=result, visible=True)
             elif result.startswith("Already"):
-                return updated_status, gr.update(value="", visible=False)
+                return gr.update(value="", visible=False)
             else:
-                return updated_status, gr.update(value=result, visible=True)
+                return gr.update(value=result, visible=True)
         
         model_dropdown.change(
             handle_model_change,
             inputs=[model_dropdown],
-            outputs=[status_info, model_status]
+            outputs=[model_status]
         )
         
-        # Update server display when interface loads
+        # Initialize both chat history and server management on load
+        def handle_interface_load():
+            """Initialize interface components on load"""
+            # Initialize chat history dropdown
+            chat_choices = agent.get_chat_list()
+            
+            # Initialize server management quickly without triggering tool discovery
+            # Tool discovery can be slow (network/package startup). Do it on-demand via the Refresh button or first chat.
+            servers = agent.get_server_status()
+            server_names = list(agent.mcp_servers.keys())
+            
+            return gr.update(choices=chat_choices, value=None), servers, server_names
+        
         interface.load(
-            fn=lambda: agent.get_server_status(),
-            outputs=[servers_display]
+            fn=handle_interface_load,
+            outputs=[chat_history_dropdown, servers_display, server_delete_dropdown]
         )
     
     return interface

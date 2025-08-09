@@ -1,0 +1,102 @@
+{
+  "next_id": 17,
+  "chats": [
+    {
+      "id": 1,
+      "title": "what time is it?",
+      "created": "2025-07-02T23:52:13.757166",
+      "last_updated": "2025-07-02T23:52:13.757166",
+      "message_count": 3
+    },
+    {
+      "id": 2,
+      "title": "Hello, this is a test message",
+      "created": "2025-07-03 01:06",
+      "message_count": 1
+    },
+    {
+      "id": 3,
+      "title": "Can you list files in the dire...",
+      "created": "2025-07-03 01:25",
+      "message_count": 1
+    },
+    {
+      "id": 4,
+      "title": "email today's top news stories...",
+      "created": "2025-07-03 01:56",
+      "message_count": 1
+    },
+    {
+      "id": 5,
+      "title": "Use the fetch tool to get toda...",
+      "created": "2025-07-03 18:05",
+      "message_count": 2
+    },
+    {
+      "id": 6,
+      "title": "Use the fetch tool to get toda...",
+      "created": "2025-07-03 18:53",
+      "message_count": 1
+    },
+    {
+      "id": 7,
+      "title": "Use the fetch tool to get toda...",
+      "created": "2025-07-03 19:04",
+      "message_count": 1
+    },
+    {
+      "id": 8,
+      "title": "Use the fetch tool to get toda...",
+      "created": "2025-07-03 19:19",
+      "message_count": 1
+    },
+    {
+      "id": 9,
+      "title": "Use the fetch tool to get toda...",
+      "created": "2025-07-03 19:32",
+      "message_count": 1
+    },
+    {
+      "id": 10,
+      "title": "1. Use the fetch tool to get t...",
+      "created": "2025-07-03 19:50",
+      "message_count": 1
+    },
+    {
+      "id": 11,
+      "title": "1. Use the fetch tool to get t...",
+      "created": "2025-07-03 20:11",
+      "message_count": 1
+    },
+    {
+      "id": 12,
+      "title": "1. Use the fetch tool to get t...",
+      "created": "2025-07-03 20:20",
+      "message_count": 1
+    },
+    {
+      "id": 13,
+      "title": "1. Use the fetch tool to get t...",
+      "created": "2025-07-03 20:25",
+      "message_count": 1
+    },
+    {
+      "id": 14,
+      "title": "1. Use the fetch tool to get t...",
+      "created": "2025-07-03 21:20",
+      "message_count": 1
+    },
+    {
+      "id": 15,
+      "title": "email a test email so we know ...",
+      "created": "2025-07-04 00:39",
+      "message_count": 1
+    },
+    {
+      "id": 16,
+      "title": "create a text file i the curre...",
+      "created": "2025-07-07 19:09",
+      "message_count": 1
+    }
+  ]
+}
